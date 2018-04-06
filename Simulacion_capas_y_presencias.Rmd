@@ -1,0 +1,150 @@
+---
+title: "Simulacion de capas y puntos de presencia"
+author: "Gerardo Martin"
+date: "6 de abril de 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Gerardo Martín
+
+Este script genera las variables que se van a utilizar en el taller de modelación de nichos con métodos bayesianos. El script está basado en el tutorial para modelar la autocorrelación espacial de Petr Keil (https://www.r-bloggers.com/spatial-autocorrelation-of-errors-in-jags/)
+
+Comenzamos por cargar los paquetes
+
+
+```{r}
+library(mvtnorm)   # para simular distribuciones normales multivariadas
+library(raster)    # para trabajar con objetos de clase ráster
+library(foreach)   # para hacer loops de manera mas avanzada
+library(dismo)     # para generar las presencias
+```
+
+Seguimos declarando las funciones que vamos a usar y sus contenidos
+
+Primero la función que calcula la distancia desde cada píxel a los demás. Esta función sólo requiere como argumento la longitud de los lados. Por el momento sólo trabajaremos con un espacio cuadrado
+```{r}
+matriz.dists <- function(long.lado)
+{
+      coords.filas <- rep(1:long.lado, times=long.lado)
+      coords.column <- rep(1:long.lado, each=long.lado)
+      filas.column <- data.frame(coords.filas, coords.column)
+      D <- dist(filas.column, method="euclidean", diag=TRUE, upper=TRUE)
+      D <- as.matrix(D)
+      return(D)
+}
+```
+
+Seguimos con la función que va a simular las variables
+
+```{r}
+sup.correl <- function(long.lado, media.global, lambda){
+      
+      require(mvtnorm)
+      
+      D <- matriz.dists(long.lado)
+      # Aquí se escala la matríz por la función exponencial (puede ser otra función!)
+      #Este es el efecto del espacio, las celdas vecinas se parecen más entre si
+      SIGMA <- exp(-lambda*D)
+      mu <- rep(media.global, times=long.lado*long.lado)
+      # Aquí generamos el contenido de la matriz que después será un objeto ráster
+      # El contenido será generado con una distribución normal multivariada
+      M <- matrix(nrow=long.lado, ncol=long.lado)
+      M[] <- rmvnorm(1, mu, SIGMA)
+      return(M)
+}
+```
+
+Y la función que transforma la vairable simulada de matriz a ráster
+
+```{r}
+matriz.a.raster <- function(matriz, extension)
+{
+      require(raster)
+      
+      rast <- raster(matriz)
+      rast@extent@xmax <- extension
+      rast@extent@ymax <- extension
+      return(rast)
+}
+```
+
+Ahora ya podemos rimular unas superficies....
+
+Para obtener resultados similares vamos a determinar una semilla, que es el número a partir del cuál se generará la serie de números aleatorios
+```{r}
+set.seed(14392)
+```
+
+Por mis H....s decidí que vamos a trabajar con 5 variables que representarán diversos aspectos del clima. El efecto de la autocorrelación espacial en cada variable será diferente y generado de manera aleatoria con una distribución uniforme, al igual que las medias globales de cada variable. Las lambdas y las medias globales son pasadas en lote a las funciones creadas arriba por medio de foreach
+
+```{r}
+lambdas <- runif(5, 0.01, 0.7) # efectos de autocorrelación
+long.lado <- 50 #Tamaño de las capas ráster
+medias.globales <- runif(5, -20, 20) #Medias de cada capa
+dists <- matriz.dists(long.lado = long.lado)
+
+capas <- foreach(i = seq_along(lambdas)) %do% {
+      mat <- sup.correl(long.lado = long.lado, media.global = medias.globales[i], lambda = lambdas[i])
+      r <- matriz.a.raster(mat, extension = 50)
+      return(r)
+}
+
+capas <- stack(capas)
+
+saveRDS(capas, 'capas-experimento.rds')
+
+plot(capas)
+
+```
+
+Ya con las capas creadas podemos generar los puntos de presencia que utilizaremos en los tutoriales que siguen (LGCP y JAGS). Los puntos los vamos a generar con un método que le aprendí al buen lichoso... Distancias de mahalanobis. Para hacer esto:
+1. Extraemos todos los datos generados arriba y ponerlos en forma de "data.frame"
+2. Generamos la matriz de covarianza (por aquello de las correlaciones y colinearidades)
+3. Calculamos las distancias centrando las variables en las medias globales calculadas arriba
+4. Transformando las distancias en ráster
+5. Transformando las distancias en probabilidades con un modelo logístico
+
+```{r}
+capas.df <- data.frame(rasterToPoints(capas))
+
+cov = cov(capas.df[,paste0('layer.',1:5)])
+
+dist.mahal <- mahalanobis(capas.df[,paste0('layer.',1:5)], center = medias.globales, cov = cov) 
+
+dist.r <- rasterFromXYZ(data.frame(capas.df[,c('x', 'y')], mahal = dist.mahal))
+
+prob.pres <- exp(dist.r*(-1))/(1 + exp(dist.r*(-1)))
+
+plot(stack(dist.r, prob.pres))
+
+```
+
+Finalmente con las funciones del paquete dismo podemos generar los puntos de presencia de acuerdo con las probabilidades calculadas arriba.
+
+Para introducir algo realismo, vamos además a introducir algo de ruido normalmente distribuido equivalente a 75% del tamaño de los píxeles
+
+
+```{r}
+presencias <- randomPoints(mask = prob.pres, n = 300, prob = T)
+
+ruido.x <- rnorm(nrow(presencias), 0, sd = 1)
+ruido.y <- rnorm(nrow(presencias), 0, sd = 1)
+
+presencias.ruido <- presencias
+
+presencias.ruido[,1] <- presencias.ruido[,1] + ruido.x
+presencias.ruido[,2] <- presencias.ruido[,2] + ruido.y
+
+saveRDS(presencias.ruido, 'presencias.rds')
+
+plot(prob.pres); points(presencias)
+plot(prob.pres); points(presencias.ruido)
+```
+
+
+
+

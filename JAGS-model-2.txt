@@ -1,0 +1,13 @@
+model{
+
+      for(i in 1:n){
+            log(lambda[i]) <- inprod(beta[], X[i,])
+            lambda.w[i] <- lambda[i] * pesos[i]
+            pres[i] ~ dpois(lambda.w[i])
+      }
+
+      for(i in 1:nX){
+            beta[i] ~ dnorm(0, 0.0001)
+      }
+
+}
