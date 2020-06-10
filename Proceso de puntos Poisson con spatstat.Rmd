@@ -1,0 +1,207 @@
+---
+title: "Proceso de puntos Poisson"
+author: "Gerardo Martin"
+date: "24 de octubre de 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Cargando y formateando los datos
+
+```{r Cargando datos, results="hide", message = FALSE}
+library(raster); library(spatstat)
+
+capas <- readRDS('capas-experimento.rds')
+presencias <- readRDS('presencias.rds')
+out <- raster::extract(capas[[1]], presencias)
+presencias <- presencias[!is.na(out),]# hay que eliminar los puntos que quedan fuera del cuadrante, si no R se muere
+```
+
+## Formateando los datos
+
+Para `spatstat` es necesario configurar los datos en clases nativas del paquete, no puede manejar objetos del paquete raster. Primero transformamos las capas a un `data.frame`:
+
+```{r}
+capas.df <- data.frame(rasterToPoints(capas))
+```
+
+Y después hay que extraer las coordenadas únicas para crear la "ventana" espacial donde vamos a trabajar:
+
+```{r}
+ux = sort(unique(capas.df$x)) #Extrayendo coordenadas únicas
+uy = sort(unique(capas.df$y))
+nx = length(ux) #Viendo cuántas coordenadas únicas tenemos
+ny = length(uy)
+ref.cols = match(capas.df$x, ux) # Señalando la posición que ocupan las coordenadas de nuestros datos
+ref.lineas = match(capas.df$y, uy)
+vec.todos = rep(NA, max(ref.lineas)*max(ref.cols)) #Creando un vector vacío con la longitud de píxeles que tienen las capas
+ref.vec = (ref.cols - 1)*max(ref.lineas) + ref.lineas
+vec.todos[ref.vec] = 1
+mascara = matrix(vec.todos, max(ref.lineas), max(ref.cols), dimnames = list(uy, ux))
+ventana = as.owin(im(mascara, xcol = ux, yrow = uy)) #Ahora sí creamos la ventana
+```
+
+Posteriormente hay que cambiar el tipo de objecto en que tenemos el proceso de puntos (las presencias). Para ello vamos a expecificar las coordenadas **X** y **Y** y la ventana espacial que contiene todos los puntos:
+
+```{r}
+ppp.dat <- ppp(presencias[, 'x'], presencias[, 'y'], window = ventana, check = F)
+```
+
+Finalmente necesitamos convertir las capas raster a `im`, que es el formato nativo de `spatstat`, y ponerlas en una lista. Esta lista la vamos a utilizar como la base de datos para ajustar el modelo:
+
+```{r}
+library(foreach)
+
+X.capas <- with(capas.df, cbind(layer.1, layer.2, layer.3, layer.4,layer.5))
+
+capas.im.list <- foreach(i = 1:ncol(X.capas)) %do% {
+            vec.todos = rep(NA, max(ref.lineas)*max(ref.cols))
+      vec.ref = (ref.cols - 1)*max(ref.lineas) + ref.lineas
+      vec.todos[ref.vec] = X.capas[,i]
+      capa <- im(matrix(vec.todos, max(ref.lineas), max(ref.cols),
+                                    dimnames = list(uy, ux)), xcol = ux, yrow = uy)
+      return(capa)
+}
+
+names(capas.im.list) =  c("layer.1", "layer.2", "layer.3", "layer.4", "layer.5") #Hay que ponerle nombre a las imégenes en la lista
+```
+
+## Revisando supuesto de aleatoriedad
+
+```{r fig.height=6, fig.width=6, message = F, results = "hide"}
+plot(envelope(ppp.dat))
+```
+
+Esta es sólo una de las múltiples pruebas de agregación espacial. Consiste en comparar el número promedio de vecinos de cada punto como función de la distancia. Las bandas grises delimitan lo que se esperaría de un proceso Poisson. Si la función $K(r)$ de los datos (lìnea negra) pasa por arriba de la banda puede ser indicativo de agregación (los puntos se "atraen"), y lo contrario indica dispersión (los puntos se segregan). En este caso parece que las presencias simuladas se acercan mucho a un proceso Poisson. A continuación veremos cómo modelar el proceso como proceso de puntos y como proceso de interacción de áreas.
+
+
+# Proceso Poisson de puntos
+
+Al igual que con DWPR podemos hacer selección del modelo por medio de eliminación de variables para disminuir el AIC:
+
+```{r, message = F, warning=F}
+modelo.ppm <- step(ppm(ppp.dat, 
+                       trend = ~ layer.1 + layer.2 + layer.3 + layer.4 + layer.5 +
+                             I(layer.1^2) + I(layer.2^2) + I(layer.3^2) + I(layer.4^2) + I(layer.5^2), 
+                       covariates = capas.im.list))
+```
+
+## Diagnosticando el modelo
+
+Una vez ajustado o seleccionado el modelo podemos revisar la fórmula final, significancia de los efectos y diagnosticar el cumplimiento de supuestos.
+
+```{r}
+summary(modelo.ppm)
+```
+
+Un paso esencial en los análisis paramétricos es la revisión de los residuales para aseguramos de que cumplimos con los supuestos de "Complete Spatial Randomness". Una de las enormes ventajas de `spatstat` es que dichas pruebas ya están disponibles: 
+
+```{r fig.height=8, fig.width=8, message = F, results = "hide", warning = F}
+diagnose.ppm(modelo.ppm, main = "Residuales de modelo.ppm")
+```
+
+El primer cuadro (arriba izquuierda) muestra el proceso de puntos. El segundo y terceros (arriba derecha y abajo izquierda) muestran los residuales acumulados en las coordenadas **X** y **Y**. El último muestra los residuales suavizados por medio de un *kernel smoothing*. Idealmente, los residuales no deben exceder las bandas de confianza en los cuadros 2$^o$ y 3$^o$. En el último cuadro deberán estar lo más cercanos a cero.
+
+Podemos hacer otros diagnósticos para ver si el proceso de puntos es exactamente un proceso poisson, por ejemplo con la función *K* de Ripley. Esta prueba de aleatoriedad espacial revisa que el número de vecinos como función de la distancia siga efectivamente una distribución Poisson. Para esta prueba `spatstat` va a hacer 100 repeticiones por default para computar las bandas de confianza:
+
+```{r fig.height=6, fig.width=6, messae = F, results="hide"}
+plot(envelope(modelo.ppm), main = "Función K de Ripley para modelo.ppm")
+```
+
+Podemos hacer la misma prueba con nuestros datos de presencia antes de iniciar los análisis. En caso de no cumplir con el supuest de CSR, deberemos utilizar un modelo de interacción de área. En este caso todo parece estar bien con el modelo...
+
+## Efectos estadísticos
+
+En pocas ocasiones nos preguntamos qué pasaría con los resultados del análisis si tuviéramos una base de datos más grande. Una manera de explorar el efecto de cada dato es revisar cómo contribuyen a la verosimilitud. En caso de que decidamos continuar el trabajo de campo, lo ideal sería utilizar los análisis con que contamos para guiar las expadiciones futuras. Estos dos aspectos se pueden explorar con las funciones `influence` y `leverage` de `spatstat`:
+
+
+```{r fig.height=6, fig.width=12}
+par(mfrow = c(1, 2))
+plot(influence(modelo.ppm), main = "Influencia")
+plot(leverage(modelo.ppm), main = "Apalancamiento")
+```
+
+
+Del lado izquierdo podemos ver cuáles presencias fueron más influyentes en los efectos estadísticos, y del lado derecho qué regiones de nuestra aŕea de estudio afectarían más las estimaciones estadísticas si llegaramos a encontrar más presencias.
+
+Otro aspecto importante de revisar son las respuestas parciales ante cada una de las variables que incluimos en el modelo. La manera más fácil de hacerlo en `spatstat` es por medio de la función `effectfun`. Para revisar los residuales a lo largo del rango de cada variable se puede utilizar la función `parres`. Son análisis muy útiles, pero tenemos que seguir!
+
+## Revisando el patrón de favorabilidad del modelo
+
+Como utilizamos las capas completas, sólo necesitamos extaer las predicciones del modelo y rasterizarlas. De una vez podemos ver los residuales:
+
+```{r, fig.height=6, fig.width=7}
+preds.ppm <- predict(modelo.ppm, ngrid = c(50, 50))
+preds.ppm.r <- raster(preds.ppm)
+plot(preds.ppm.r); points(presencias)
+```
+
+Comparando las predicciones con la favorabilidad simulada:
+
+```{r Resultados PPM, fig.height=6, fig.width=12}
+prob.pres <- readRDS("Probabilidad presencia.rds")
+
+par(mfrow = c(1, 2))
+plot(prob.pres, main = "Probabilidad de presencia")
+plot(preds.ppm.r, main = "Intensidad estimada con ppm")
+```
+
+# Proceso de interacción de áreas
+
+Este método consiste en estimar un término que depende de la interacción entre pares de puntos que comparten un área determinada por un radio alrededor de cada punto. Es el más simple de los métodos y sólamente permite la interaccion entre pares (no hay interacciones entre más de dos puntos). Los métodos disponibles en `spastat` los pueden estudiar en el libro del paquete (http://spatstat.org/book.html).
+
+Comenzaremos entonces por encontrar el tamaño óptimo del radio. Para ello necesitamos crear un `data.frame` que contenga la serie de radios que deseamos perfilar:
+
+```{r}
+radios <- data.frame(seq(1, 10, 1))
+names(radios) <- "r"
+form <- formula(modelo.ppm)
+radios.res <- profilepl(s = radios, f = AreaInter, Q = ppp.dat, trend = form, covariates = capas.im.list)
+```
+
+Revisamos cuál es el tamaño óptimo del radio
+
+```{r}
+summary(radios.res)
+```
+
+Ahora sí ajustamos el modelo con interacción de áreas en un radio de 1 (unidades de distancia lineal):
+
+```{r}
+modelo.ppm.ai <- ppm(ppp.dat, trend = form, covariates = capas.im.list, interaction = AreaInter(1))
+summary(modelo.ppm.ai)
+```
+
+Ahora hagamos el diagnóstico del modelo revisando primero los residuales:
+
+```{r fig.height=8, fig.width=8, message = F, results = "hide", warning = F}
+diagnose.ppm(modelo.ppm.ai, main = "Residuales de modelo.ppm.ai")
+```
+
+Y viendo que el patrón de puntos que el modelo produce se ajusta al supuesto de interacción entre áreas:
+
+```{r fig.height=6, fig.width=6, message = F, results = "hide"}
+plot(envelope(modelo.ppm.ai))
+```
+
+Podemos ver el efecto de la interacción entre puntos como función de la distancia:
+
+```{r fig.height=6, fig.width=6}
+interaccion <- fitin(modelo.ppm.ai)
+plot(interaccion)
+```
+
+Finalmente compararemos las predicciones de `modelo.ppm` com `modelo.ppm.ai`:
+
+```{r fig.height=6, fig.width=12}
+preds.ppm.ai <- predict(modelo.ppm.ai, ngrid = c(50, 50))
+preds.ppm.ai.r <- raster(preds.ppm.ai)
+par(mfrow = c(1,2))
+plot(preds.ppm.ai.r, main = "Modelo de interacción de áreas")
+plot(preds.ppm.r, main = "Modelo de puntos Poisson")
+```
+
+En este caso, los modelos son prácticamente idénticos.
