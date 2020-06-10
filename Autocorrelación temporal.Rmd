@@ -1,0 +1,104 @@
+---
+title: "Autocorrelación temporal"
+author: "Gerardo Martin"
+date: "October 1, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+#Simulación de una base de datos
+
+Comenzamos por simular una base de datos, donde $x$ sea la variable independiente y $y$ la dependiente. Nótese que en el loop ```for``` la variable $y$ depende tanto de $x$ como de sí misma. Es por esto que está autocorrelacionada y tiene una estructura típica de una línea de tiempo.
+
+```{r}
+set.seed(14392)
+tiempo <- 100
+
+beta <- rnorm(1, 0, 1)
+alfa <- rnorm(1, 0, 1)
+
+x <- numeric(tiempo); x[1] <- rnorm(1)
+y <- numeric(tiempo); y[1] <- rnorm(1)
+for(i in 2:tiempo) {
+      x[i] <- x[i - 1] + rnorm(1)
+      y[i] <- y[i - 1] + rnorm(1, alfa + beta * x[i], 1)
+      }
+```
+
+Para ver la relación entre $y$, el tiempo, $x$ y su autocorrelaación podemos hacer las siguientes gráficas:
+
+```{r fig.height=4, fig.width=12}
+par(mfrow = c(1, 3))
+plot(x = 1:tiempo, y = y, xlab = "Tiempo", ylab = "y")
+plot(x = x, y = y, xlab = "x", ylab = "y")
+acf(y, xlab = "Retraso", ylab = "Correlación")
+```
+
+La tercera gráfica se llama autocorrelograma, y representa la correlación de $y$ consigo mismaa diferentes retrasos. En el código de abajo se puede ver lo que quiero decir con "retraso":
+
+```{r fig.height=4, fig.width=12}
+par(mfrow = c(1, 3))
+plot(y[1:99], y[2:100], main = "Retraso de 1 unidad de tiempo") 
+plot(y[1:98], y[3:100], main = "Retraso de 2 unidades de tiempo")
+plot(y[1:70], y[31:100], main = "Retraso de 30 unidades de tiempo")
+```
+
+En otras palabras, la correlación de $y$ en las posisiones 1-99 con $y$ en las posiciones 2-100, 1-98 con 3:100 y 1-70 con 31-100. Las posiciones son la estructura de la variable.
+
+#Analizando las variables
+
+Vamos a analizar la relación entre $x$ y $y$ con un modelo lineal simple donde:
+
+$$ y = a + b \times x$$
+
+```{r}
+modelo <- lm(y ~ x)
+summary(modelo)
+```
+
+Para ver si la autocorrelación que vimos en el autocorrelo grama tiene un efecto en la regresión vemos las gráficas diagnósticas:
+
+```{r fig.height=6, fig.width=6}
+par(mfrow = c(2,2))
+plot(modelo)
+```
+
+Particularmente los residuales. Éstos deben ser independientes de si mismos, es decir, no deben reflejar la estructura temporal o espacial de los datos:
+
+```{r fig.height=4, fig.width=8}
+par(mfrow = c(1, 2))
+acf(rstandard(modelo), xlab = "Retraso", ylab = "Correlación", main = "Autocorrelograma")
+plot(x = x, y = y, cex = rstandard(modelo), main = "Residuales")
+```
+
+Aquí podemos ver que los residuales están autocorrelacionados. El autocorrelograma muestra una correlación más alta de lo aceptable (líneas azules), y son más grandes en los valores mas pequeños de $x$ (gráfica de la derecha).
+
+## Corrigiendo la autocorrelación
+
+Para corregir la autocorrelación temporal podemos usar la función ```gls``` del paquete ```nlme```. Vamos a incluir un efecto aleatorio con una estructura de autocorrelación de un paso (```corAR1```). De paso vamos a compararla con un modelo ```gls``` sin efectos aleatorios.
+
+```{r}
+library(nlme)
+t <- 1:tiempo
+modelo.1 <- gls(y ~ x)
+modelo.2 <- gls(y ~ x, correlation =  corAR1(form = ~t))
+summary(modelo.1)
+summary(modelo.2)
+```
+
+Ahora veamos cómo se portan los residuales en ambos modelos:
+
+```{r fig.height=8, fig.width=8}
+par(mfrow = c(2, 2))
+resids.m1 <- residuals(modelo.1, type = "normalized")
+resids.m2 <- residuals(modelo.2, type = "normalized")
+acf(resids.m1, xlab = "Retraso", ylab = "Correlación", main = "modelo.1")
+acf(resids.m2, xlab = "Retraso", ylab = "Correlación", main = "modelo.2")
+plot(x, y, cex = resids.m1, ylab = "y", main = "Residuales")
+plot(x, y, cex = resids.m2, ylab = "", main = "")
+```
+
+Lo mismo se puede hacer para corregir los residuales en un modelo con datos espaciales. La diferencia es que debemos especificar un modelo para el semivariograma. Este modelo especifica la autocorrelación de los datos como función de la distancia lineal entre los datos.
