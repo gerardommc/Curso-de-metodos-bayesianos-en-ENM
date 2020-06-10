@@ -9,7 +9,7 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-Ya vimos cómo se hace una DWPR frecuentista. Ahora veamos cómo hacer la contra parte bayesiana, sin modelar la autocorrelación espacial. Para la parte sin autocorrelación espacial utilizaremos JAGS. Es posible modelar el componente espacial con una distribución normal-condicional autorregresiva en Open y Win BUGS. Sin embargo éstos son tremendamente lentos y quisquillosos de implementar a través de R. Por lo que para la sección del componente espacial les mostraré un ejemplo con el paquete `lgcp`.
+Ya vimos cómo se hace una DWPR frecuentista. Ahora veamos cómo hacer la contra parte bayesiana, sin modelar la autocorrelación espacial. Para la parte sin autocorrelación espacial utilizaremos JAGS. Es posible modelar el componente espacial con una distribución normal-condicional autorregresiva en Open y Win BUGS. Sin embargo éstos son tremendamente lentos y quisquillosos de implementar a través de R. Por lo que para la sección del componente espacial les mostraré un ejemplo con el paquete `lgcp`. 
 
 Comenzaremos por leer los datos y cargar los paquetes necesarios.
 
