@@ -1,0 +1,316 @@
+---
+title: "Proceso de puntos bayesiano"
+author: "Gerardo Martin"
+date: "9 de mayo de 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introducción
+
+Hasta a hora nos hemos enfocado en modelar el número de puntos por unidad de área. Los procesos de puntos en cambio modelan las unidades de área en si. Por definición las unidades de área deben ser tan finas como sean necesarias de manera que sólo puedan incluir un punto de presencia. En un mundo ideal las unidades espaciales son completamente independientes entre sí. Sin embargo, en pocas ocasiones se da dicho fenómeno. Una técnica estadística para forzar dicha independencia son los campos Gaussianos. De manera general un campo Gaussiano en el plano `x, y` es una distribución multivariada que toma en cuenta la correlación entre vecinos dependiendo de la distancia que seara el centro de cada unidad espacial (calculada con el teorema de pitágoras entre los pares de puntos). De este modo se obtiene un modelo de regresión con dos interceptos por unidad espacial, uno fijo, que representa la intensidad media de puntos, y otro aleatorio que representa la varianza que resulta de la proximidad espacial. Una ventaja de esta técnica es que permite utilizar bases de datos enteras sin necesidad de "adelgazarlas" para reducir la dependencia entre datos.
+
+Aquí vamos a imlplementar dicha técnica con los mismos datos simulados utilizando un paquete se que llama `lgcp`.
+
+# Implementación de `lgcp`
+
+Como es costumbre comenzamos por leer los datos (capas y puntos de presencia), y Vamos a asumir que nuestros datos están definidos en un sistema de coordenadas proyectado.
+
+```{r Leyendo datos y cargando paquetes, message=FALSE, results = "hide"}
+library(lgcp); library(raster); library(rgdal); library(spatstat)
+
+capas <- readRDS('capas-experimento.rds')
+presencias <- data.frame(readRDS('presencias.rds'))
+out <- raster::extract(capas[[1]], presencias)
+presencias <- presencias[!is.na(out),]
+```
+
+# Formateando los datos
+
+En esta serie de pasos necesitamos transformar los datos en formato de los paquetes `raster` y `sp` a `spatstat`.
+
+Comenzamos por extraer la "ventana" en la que crearemos la rejilla con las unidades espaciales:
+
+```{r Creando la ventana, message=FALSE, warning = F, results="hide"}
+r <- capas[[1]]; r[!is.na(r[])] <- 1
+ventana <- rasterToPolygons(r, dissolve = T)
+spatstat.options(checkpolygons = F)
+ventana <- as(ventana, 'owin')
+ventana <- simplify.owin(ventana, dmin = 1)#Este argumento dmin representa el tamaño de los pixeles de los datos originales      
+spatstat.options(checkpolygons = T)
+```
+
+Y continuamos por transformar las presencias a un objeto de clase `ppp`:
+
+```{r Formateando las presencias, message=FALSE, results = "hide", warning = F}
+pres.ppp <- ppp(x = presencias[,1], y = presencias[,2], 
+            window = ventana)
+```
+
+# Cálculos previos
+
+En los ejemplos anteriores no tomamos ningún paso en concreto para estimar la definición óptima del proceso espacial. En este caso es estrictamente necesario para poder realizar el cómputo ya que es muy intenso. En el siguiente paso vemos cómo estimar el tamaño óptimo de las celdas con un método no paramétrico, que se llama de *contraste mínimo*. El proceso toma unos minutos
+
+```{r Estimado la escala, message=FALSE, warning=F, results="hide"}
+escala <- minimum.contrast(pres.ppp, model = 'exponential', method = 'K',
+                                   intens = density(pres.ppp), transform = log)
+```
+
+```{r}
+escala
+```
+
+Esto nos indica que en lugar de utilizar una escala de 1, necesitamos aumentar la definición a 0.00007 aproximadamente. Con el comando `chooseCellwidth` podemos ver cómo quedarían las rejillas. Este tipo de resultados son frecuentes, sin embargo son imposibles de conseguir, pues no podemos obtener datos más finos de lo que ya tenemos! Es en estos momentos en los que la estadística entra en conflicto con la biología, pues la resolución estadística óptima puede no tener ningún sentido biológico. Por el momento he decidido bajar la resolución a la mitad, pues nuestro ejemplo es completamente sintético:
+
+```{r cellWidth, fig.height=6, fig.width=6}
+chooseCellwidth(pres.ppp, cwinit = 1.7)
+tamano.celdas <- 1.7
+```
+
+# Parámetros iniciales de la función de covarianza
+
+```{r fig.height=6, fig.width=6}
+library(geoR)
+
+presencias$layer.1 <- raster::extract(capas[[1]], presencias)
+presencias <- na.omit(presencias)
+vari <- variog(coords=presencias[, c("x", "y")], data=presencias$layer.1, max.dist=3)
+plot(vari, xlab = "Distancia")
+```
+
+Ahora vamos a ajustar el variograma para usar las estimaciones del modelo de covarianza como "priors" del modelo bayesiano. Vamos a utilizar el modelo exponencial, la formulación de `geoR` es la siguiente:
+
+$$ \rho(d) = \exp(-d/\phi) $$
+
+```{r}
+vari.ajust <- variofit(vari,ini.cov.pars=c(0.1,0.5), cov.model="exponential",
+                     fix.nugget=T, nugget=0.5, fix.kappa=T)
+summary(vari.ajust)
+```
+
+
+# Transformando el resto de los datos
+
+Tenemos que transformar las capas raster a un objeto `SpatialPixelsDataFrame`. Es muy similar al `stack` utilizado por `raster`.
+
+```{r}
+capas.df <- data.frame(rasterToPoints(capas))
+capas.pix.df <- SpatialPixelsDataFrame(capas.df[, c("x", "y")], capas.df[, 3:ncol(capas.df)])
+```
+
+## Creando la rejilla para evaluar la intensidad de puntos
+
+Este es generalmente uno de los pasos que más tarda en completar. Puede tardar incluso un par de horas. Esto, claro, depende enteramente de los datos
+
+```{r, message = F, warning=F, results="hide"}
+rejilla <- getpolyol(data = pres.ppp, pixelcovariates = capas.pix.df, cellwidth = tamano.celdas)
+```
+
+A continuación tenemos que asignar el tipo de interpolación para cada una de las variables. Esto es de suma importancia, puesto que algunos tipos de variables no pueden ser interpoladas por medio del `ArealWeightedMean`. Un ejemplo son las variables que representan densidad poblacional o las variables categóricas. Para el primero sería más deseable utilizar un `ArealWeightedSum` y para el segundo un `Majority`. En este caso utilizaremos la media pesada por el área para todas:
+
+```{r, message=F, results="hide"}
+capas.pix.df@data=guessinterp(capas.pix.df@data)
+capas.pix.df@data <- assigninterp(df = capas.pix.df@data, vars = c("layer.1", "layer.2", "layer.3", "layer.4", "layer.5"),
+                           value = "ArealWeightedMean")
+
+```
+
+Ahora que ya le hemos indicado al objeto `capas.pix.df` cómo debe ser interpolado a la resolución que utilizaremos para el análisis, ya podemos crear la matriz del modelo. Para ello utilizaremos los demás objetos que ya creamos en el camino (`pres.ppp`, `tamano.celdas` y `rejilla`):
+
+```{r}
+Zmat <- getZmat(formula = X ~ layer.1 + I(layer.1^2) +
+                      layer.2 + I(layer.2^2) +
+                      layer.3 + I(layer.3^2) +
+                      layer.4 + I(layer.4^2) +
+                      layer.5 + I(layer.5^2),
+                data = pres.ppp, pixelcovariates = capas.pix.df,
+                cellwidth = tamano.celdas, overl = rejilla, ext = 2)
+```
+
+```{r fig.height=6, fig.width=8, message=F}
+par(mfrow = c(3, 4))
+plot(Zmat)
+```
+
+
+# Preparando configuración del modelo
+
+Como vimos con JAGS es necesario proporcionar cierta información como la duración de las cadenas, la tasa de adelgazamiento (thinning), el número de iteraciones que vamos a descartar en el inicio y por supuesto la distribución de los parámetros. Comenzaremos con definir la función de convarianza. En nuestro ejemplo ya sabemos que todas las variables fueron construidas con la función exponencial, sin embargo es muy difícil saber si así se comportarán tambien los datos. Debido a que dicha función es la más sencilla es buena idea comenzar a experimentar con ella.
+
+```{r Función de correlación}
+cf <- CovFunction(exponentialCovFct)
+```
+
+También se pueden utilizar otras funciones definidas en el paquete `RandomFields`, o la `SpikedExponentialCovFct`, que al igual que la exponencial sólo tiene un parámetro.
+
+Una vez definida las función de covarianza, definimos los priors. Todos los efectos fijos (`betaprior`) provendrán de una distribución normal con media 0 y varianza de $10^6$. Los priors del parámetro de la función exponencial y la co-varianza (`etaprior`) provendrán de una distribución log-normal.
+
+Por lo que asumiremos que los priors en escala logarítmica son 1 ($\exp(0)$) y 7 ($\exp(\phi)$ que estimamos con el variograma):
+
+```{r Previos}
+nbeta = 11
+priors <-lgcpPrior(etaprior = PriorSpec(LogGaussianPrior(mean = log(c(2, 2)),
+                                                         variance = diag(c(0.15, 0.15)))),
+                   betaprior = PriorSpec(GaussianPrior(mean = rep(0, nbeta),
+                                                       variance = diag(rep(10^6, nbeta)))))
+
+```
+
+Ahora especificamos la duración de las cadenas, el número de iteraciones que decartaremos al inicio y el número de iteraciones que vamos a guardar. Por ser un ejercicio, vamos a correr una cadena corta de 10K iteraciones. En situaciones del mundo real, pueden llegar a necesitarse 20M de iteraciones, con tiempos de cómputo que superan los 10 dias.
+
+```{r Configuración de cadena}
+len.burn.thin <- c(5000, 500, 4)
+```
+
+Ahora sí ya tenemos todo listo para empezar a sufrir:
+
+```{r Corriendo el modelo, results="hide", warning=F, message=F}
+ppm.lgcp <- lgcpPredictSpatialPlusPars(formula = X ~ layer.1 + I(layer.1^2) +
+                      layer.2 + I(layer.2^2) +
+                      layer.3 + I(layer.3^2) +
+                      layer.4 + I(layer.4^2) +
+                      layer.5 + I(layer.5^2),
+                                   sd = pres.ppp , Zmat = Zmat,
+                                   model.priors = priors, 
+                                   model.inits = NULL ,
+                                   spatial.covmodel = cf,
+                                   ext = 2,
+                                   cellwidth = tamano.celdas, 
+                                   poisson.offset = NULL,
+                                   output.control = setoutput(gridfunction = dump2dir("Resultados", forceSave = T),
+                                                              gridmeans = MonteCarloAverage(c('mean'), lastonly = T)),
+                                   mcmc.control = mcmcpars(mala.length = len.burn.thin[1], burnin = len.burn.thin[2],retain = len.burn.thin[3],
+                                                           adaptivescheme = andrieuthomsh(inith = 1, alpha = 0.5, C = 1, targetacceptance = 0.574))
+                              )
+```
+
+Antes que nada, vamos a comenzar por ver qué tan lejos estuvimos de la convergencia.
+
+## Previos vs posteriores
+
+```{r}
+par(mfrow = c(3,5)); priorpost(ppm.lgcp) 
+```
+
+Estos histogramas representan las distribuciones posteriores de los parámetros
+
+## Traza de las simulaciones
+
+```{r}
+par(mfrow = c(3,5)); traceplots(ppm.lgcp)
+```
+
+Aquí podemos comenzar a ver que los parámetros de la función exponencial no convirgieron, sus cadenas parecen haber deambulado bastante sin encontrar una media estable. El resto de los parámetros no se ven tan mal.
+
+## Función de covarianza
+
+```{r}
+par(mfrow = c(1,1)); postcov(ppm.lgcp)
+```
+
+Esta es la función exponencial que ajustó el modelo, según podemos ver la autocorrelacion espacial afecta a celdas que están cuando menos a 6 unidades de distancia.
+
+## Autocorrelación de las cadenas
+
+```{r}
+par(mfrow = c(3,5)); parautocorr(ppm.lgcp)
+```
+
+Con estas gráficas resulta obvio que $\sigma$ y $\phi$ estuvieron lejos de converger. Necesitaríamos correr cadenas bastante más largas, pero estoy casi seguro de que convergirían bien con los previos que le dimos. El resto de los parámetros estuvieron cerca de converger.
+
+# Predicciones del modelo
+
+Primero vamos a revisar el componente espacial, es decir, el efecto aleatorio o intercepto por píxel:
+
+```{r fig.height=6, fig.width=7}
+plot(ppm.lgcp)
+```
+
+Para ver las estimaciones de intensidad de punto por unidad de área tenemos que hacer algo parecido a lo que hicimos con JAGS. Comenzamos por crear un `data.frame` con nuevos datos, extraemos los parámetros estimados y hacemos la operación lineal de acuerdo con la matriz del modelo:
+
+```{r, message = F, warning=F, results = "hide"}
+nuevos.datos <- data.frame(rasterToPoints(capas))
+
+coeffs <- ppm.lgcp$betarec
+
+Xmat <- model.matrix( ~ layer.1 + I(layer.1^2) +
+                      layer.2 + I(layer.2^2) +
+                      layer.3 + I(layer.3^2) +
+                      layer.4 + I(layer.4^2) +
+                      layer.5 + I(layer.5^2),  nuevos.datos)
+
+pred <- poisson()$linkinv(coeffs[,1:11]%*%t(Xmat))
+
+rownames(pred) <- 1:nrow(pred)
+```
+
+ Finelmente extraemos la media y los intervalos de credibilidad:
+
+```{r, message=F, results = "hide"}
+library(plyr) #Para manipular data.frames
+library(coda) #Para tratar las predicciones del modelo como cadenas de markov
+
+pred.intervalos <- adply(pred, 2, function(x){
+      data.frame(Mediana=median(x), 
+                 bajo = HPDinterval(as.mcmc(x))[1],
+                 alto = HPDinterval(as.mcmc(x))[2])
+})
+
+pred.intervalos$x <- nuevos.datos$x; pred.intervalos$y <- nuevos.datos$y #Añadimos las columnas con las coordenadas x y y
+
+pred.mediana <- rasterFromXYZ(subset(pred.intervalos, select = c('x', 'y', 'Mediana'))) #Convertimos a raster
+pred.alto <- rasterFromXYZ(subset(pred.intervalos, select = c('x', 'y', 'alto')))
+pred.bajo <- rasterFromXYZ(subset(pred.intervalos, select = c('x', 'y', 'bajo')))
+```
+
+
+```{r, fig.height=6, fig.width=7}
+plot(pred.mediana, main = "Mediana"); points(presencias)
+```
+
+Como utilizamos un método MCMC, tenemos una distribución de valores de intensidad por píxel. De modo que podemosver los intervalos de credibilidad:
+
+```{r, fig.height=6, fig.width=13}
+par(mfrow= c(1, 2))
+plot(pred.bajo, main = "Intervalo 2.5%")
+plot(pred.alto, main = "Intervalo 97.5%")
+```
+
+Y también es posible calcular la probabilidad de ocurrencia con base en un nivel de intensidad pre-establecido. En este caso utilizaremos la media como valor umbral para estimat la probabilidad de que haya condiciones mejores que la mediana para la presencia de lo que estemos estudiando:
+
+```{r, message=F, warning = F, results = "hide"}
+Xmat.pres <- model.matrix(~layer.1 + I(layer.1^2) +
+                      layer.2 + I(layer.2^2) +
+                      layer.3 + I(layer.3^2) +
+                      layer.4 + I(layer.4^2) +
+                      layer.5 + I(layer.5^2), 
+                          data = data.frame(raster::extract(capas, presencias[, c("x", "y")]))) #Creamos la matriz del modelo
+
+pred.locs <- poisson()$linkinv(coeffs %*% t(Xmat.pres)) #La predicción lineal
+
+rownames(pred.locs) <- 1:nrow(pred.locs)
+
+pred.locs <- adply(pred.locs, 2, function(x) {
+      data.frame(Mediana=median(x), HPDinterval(as.mcmc(x))) #Extraemos la mediana de las predicciones
+})
+
+prob.mediana <- adply(pred, 2, function(x){
+      length(which(x > quantile(pred.locs$Median, 0.95)))/length(x) #Calculando la propoción de muestras mayores que la media
+})
+
+prob.mediana$x <- nuevos.datos$x; prob.mediana$y <- nuevos.datos$y
+prob.mediana.r <- rasterFromXYZ(subset(prob.mediana, select = c('x', 'y', 'V1'))) #Convirtiendo a raster
+```
+
+Y comprobamos las predicciones del modelo `lgcp` con la probabilidad que utilizamos para generar los puntos de presencia:
+
+```{r fig.height=6, fig.width=13}
+par(mfrow = c(1, 2))
+plot(prob.mediana.r, main = "Estimaciones lgcp")
+plot(readRDS("Probabilidad presencia.rds"), main = "Original")
+```
+
+Es evidente, que aunque el modelo no haya convergido, ha hecho un buen trabajo, cuando menos visualmente. Quizás las predicciones mejoren si tomamos en cuenta los efectos aleatorios.
