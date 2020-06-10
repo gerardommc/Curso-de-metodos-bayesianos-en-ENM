@@ -1,0 +1,248 @@
+---
+title: "DWPR bayesiana"
+author: "Gerardo Martin"
+date: "4 de abril de 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Ya vimos cómo se hace una DWPR frecuentista. Ahora veamos cómo hacer la contra parte bayesiana, sin modelar la autocorrelación espacial. Para la parte sin autocorrelación espacial utilizaremos JAGS. Es posible modelar el componente espacial con una distribución normal-condicional autorregresiva en Open y Win BUGS. Sin embargo éstos son tremendamente lentos y quisquillosos de implementar a través de R. Por lo que para la sección del componente espacial les mostraré un ejemplo con el paquete `lgcp`.
+
+Comenzaremos por leer los datos y cargar los paquetes necesarios.
+
+```{r, message= F, results = "hide", warning = F}
+library(raster); library(R2jags); library(parallel); library(ggplot2)
+
+capas <- readRDS('capas-experimento.rds')
+presencias <- readRDS('presencias.rds')
+
+capas.df <- data.frame(rasterToPoints(capas))
+presencias.r <- rasterize(presencias, capas[[1]], fun = 'count')
+presencias.r[is.na(presencias.r[])] <- 0
+
+presencias.df <- data.frame(rasterToPoints(presencias.r))
+
+```
+
+Debido a que JAGS utiliza simulación MCMC para estimar los parámetros de las distribuciones, es muy lento. Por lo que utilizaremos un número menor de puntos de background.
+
+```{r}
+pesos <- rep(50 * 50, nrow(capas.df))
+
+pesos[presencias.df$layer > 0] <- 1/pesos[1] #Los pesos para las presencias son inversos
+pesos[presencias.df$layer == 0] <- pesos[presencias.df$layer == 0]
+
+capas.df$pres <- presencias.df$layer
+capas.df$pesos <- pesos
+```
+
+
+Ahora que ya tenermos la base de datos completa y lista para analizar continuamos con el modelo que pasaremos a JAGS. Hay dos alternativas para pasarle el modelo a JAGS, aquí sólo vamos a utilizar una que sirve para todas las implementaciones de JAGS
+
+Para implementar el modelo en JAGS necesitamos necesitamos el código de JAGS. La sintaxis de JAGS y OpenBUGS son muy similares entre sí y con R, así que no habrá grandes problemas para que le entiendan. Las principales diferencias son que JAGS y OpenBUGS sólo aceptan la asignación de cantidades por medio de `<-` para variables determinísticas, y con `~` para los nodos estocásticos (no se acepta `=`). En cualquier tipo de variable está prohibida la reasignación de cantidades, por ejemplo:
+
+```{r}
+x <- c(); x[1] <- 1; x[2] <- 2; x[1] <- 3
+```
+
+Resultaría en un error, pues estaríamos asignando el contenido de x[1] más de una vez.
+
+El script de JAGS consta de dos secciones: las distribuciones previas (los famosos priors) y la función de verosimilitud. Una de las bondades de JAGS y OpenBUGS es que no es necesario que estén en un orden específico, pues el script sólo es interpretado como una serie de declaraciones.
+
+El modelo que corrimos con DWPR frecuentista se epsecifica de la siguiente manera:
+
+```{r}
+modelString <- "model{
+
+#Función de verosimilitud
+
+for(i in 1:n){
+
+      log(lambda[i]) <- alpha + beta.1 * layer.1 + beta.1.1 * pow(layer.1, 2) + 
+                        beta.2 * layer.2 + beta.2.1 * pow(layer.2, 2) +
+                        beta.3 * layer.3 + beta.3.1 * pow(layer.3, 2) +
+                        beta.4 * layer.4 + beta.4.1 * pow(layer.4, 2) +
+                        beta.5 * layer.5 + beta.5.1 * pow(layer.5, 2) # Esta es la fórmula del modelo
+
+      lambda.w[i] <- lambda[i] * pesos[i] # Aquí entramos los pesos
+
+      pres[i] ~ dpois(lambda.w[i]) # Aquí le indicamos a JAGS que la variable de respuesta tiene una distribución poisson
+}
+
+#Distribuciones previas de los parámetros de regresión
+
+      alpha ~ dnorm(0, 0.0001)
+      beta.1 ~ dnorm(0, 0.0001)
+      beta.1.1 ~ dnorm(0, 0.0001)
+      beta.2 ~ dnorm(0, 0.0001)
+      beta.2.1 ~ dnorm(0, 0.0001)
+      beta.3 ~ dnorm(0, 0.0001)
+      beta.3.1 ~ dnorm(0, 0.0001)
+      beta.4 ~ dnorm(0, 0.0001)
+      beta.4.1 ~ dnorm(0, 0.0001)
+      beta.5 ~ dnorm(0, 0.0001)
+      beta.5.1 ~ dnorm(0, 0.0001)
+
+}"
+
+writeLines(modelString, 'JAGS-model.txt')
+```
+
+Este script sirve muy bien para entender cómo debe ir estructuradi, pero es poco flexible  (no sirve para hacer selección de modelo por ejemplo, aunque ya la hicimos previamente con `glm` en DWPR).
+
+La manera más flexible de especificar el modelo es menos ilustrativa de lo que el modelo hace. La ventaja es que se pueden correr muchos modelos en lote. El truco está en especificar la matriz del modelo y pasar la matriz en la lista de datos para JAGS:
+
+```{r}
+modelString2 <- "model{
+
+      for(i in 1:n){
+            log(lambda[i]) <- inprod(beta[], X[i,]) #X es la matriz
+            lambda.w[i] <- lambda[i] * pesos[i]
+            pres[i] ~ dpois(lambda.w[i])
+      }
+
+      for(i in 1:nX){
+            beta[i] ~ dnorm(0, 0.0001) # Los parámetros son un vector
+      }
+
+}"
+
+writeLines(modelString2, "JAGS-model-2.txt")
+```
+
+Ahora sólo vamos a trabajar con la segunda versión del modelo. Lo que sigue es formatear los datos. Para ello necesitamos crear una lista que contenga TODA la información requerida para correr el modelo especificado arriba.
+
+Aquí extraemos las presencias y puntos de cuadratura, que utilizaremos para la regresión.
+
+```{r}
+pres <- capas.df[capas.df$pres > 0,]
+aus <- capas.df[capas.df$pres == 0,]
+n <- 200 #El número de puntos de background que usaremos en el ejemplo
+aus <- aus[sample(1:nrow(aus), n),]
+aus$pesos <- aus$pesos/n
+datos.regresion <- rbind(pres, aus)
+```
+
+Creamos la matriz del modelo. Cada una de las columnas serán las variables y la variable misma al cuadrado
+
+```{r}
+X.mat <- model.matrix( formula("~ layer.1 + I(layer.1^2) +
+                        layer.2 + I(layer.2^2) +
+                        layer.3 + I(layer.3^2) +
+                        layer.4 + I(layer.4^2) +
+                        layer.5 + I(layer.5^2)") ,datos.regresion)
+```
+
+Ahora creamos una lista con cada uno de los datos que necesitamos en el script. Vean que los nombres coinciden, pues así es como JAGS podrá leer los datos. Finalmente tenemos que especificar el nombre de los parámetros que queremos que JAGS guarde.
+
+```{r}
+lista.datos <- list(X = X.mat, pres = datos.regresion$pres/datos.regresion$pesos, #Las presencias sub-pesadas
+                  n = nrow(X.mat),  pesos = datos.regresion$pesos,
+                  nX = ncol(X.mat))
+
+parametros <- c("beta")
+```
+
+
+Ahora ya estamos listos para correr JAGS. Simplemente hay un par de cosas más que considerar:
+
+1. El número de iteraciones (n.iter)
+2. La proporción de iteraciones que se guardarán (n.thin)
+3. El número de iteraciones que se descartarán al inicio de las cadenas (n.burnin)
+4. El número de cadenas (n.chains)
+
+En un experimento del mundo real esto depende completamente de la convergencia, es decir, si el muestreador encontró las distribuciones "verdaderas" de los parámetros. Más tarde veremos cómo se hace esto:
+
+# Corriendo JAGS
+
+```{r, message=F, results="hide", warning = F}
+modelo <- jags.parallel(data = lista.datos,
+               model.file = "JAGS-model-2.txt",
+               parameters.to.save = parametros,
+               n.chains = 3,
+               n.iter = 5000,
+               n.thin = 4,
+               n.burnin = 500,
+               n.cluster = 3) #Este argumento lo omitimos si utilizamos la función normal jags(...)
+```
+
+Una vez corrido el modelo necesitamos revisar que efectivamente hayamos encontrado los valores óptimos de los parámetros. El primer paso es revisar el parámetro "Rhat" y el número de muestras efectivas, lo cual siempre queda guardado en el resumen del modelo. Como regla de pulgar necesitamos que "Rhat" siempre valga menos de 1.1 y que el número de muestras efectivas sea mayor de 1000:
+
+```{r}
+modelo <- readRDS("DWPR-jags.rds")
+print(modelo)
+```
+
+A la hora de revisar el resumen del modelo podemos empezar a detectar variables que no convergen...
+
+Después vemos cómo se comportaron las cadenas:
+
+```{r Trace and density plots 1, fig.height=8, fig.width=6, message=F, warning=F}
+library(ggmcmc)
+
+ggs_traceplot(ggs(as.mcmc(modelo)[,1:5]))
+ggs_density(ggs(as.mcmc(modelo)[,1:5]))
+```
+
+
+Ahora veamos cómo el modelo reprodujo la favorabilidad
+
+```{r}
+params <- as.matrix(as.mcmc(modelo))[, paste0("beta[", 1:ncol(X.mat), "]")]
+X.mat.pred <- model.matrix(formula("~ layer.1 + I(layer.1^2) +
+                        layer.2 + I(layer.2^2) +
+                        layer.3 + I(layer.3^2) +
+                        layer.4 + I(layer.4^2) +
+                        layer.5 + I(layer.5^2)"), capas.df)
+preds <- X.mat.pred %*% t(params)
+
+library(foreach)
+preds.ints <- foreach(i = 1:nrow(preds), .combine = rbind) %do% {
+     c(med = median(preds[i,]), HPDinterval(as.mcmc(preds[i,]), 0.95)) 
+}      
+```
+
+Ahora transformamos las predicciones en objetos raster
+
+```{r, fig.height=8, fig.width=8, message = F, warning=F}
+preds.r <- rasterFromXYZ(data.frame(capas.df[, c("x", "y")], preds.ints))
+
+prob.pres <- readRDS("Probabilidad presencia.rds")
+
+plot(exp(preds.r[[1]])); points(presencias)
+plot(prob.pres)
+```
+
+Podemos ver que aunque el modelo no convirgió con las 100k iteraciones que le dimos, logró más o menos reproducir el patrón que de entrada determinó las presencias que utilizamos. Hay que notar también que la escala resultante es diferente que la de DWPR frecuentista.
+
+A continuación veremos cómo se puede verificar que las cadenas MCMC haya convergido, es decir, que hayan encontrado la distribución posterior de los parámetros. Utilizaremos tres diagnósticos, el de Gelman, autocorrelación y Geweke:
+
+## Diagnóstico de Gelman
+```{r}
+gelman.diag(as.mcmc(modelo))
+```
+
+Como regla de dedo, estaríamos buscando que la estimación puntual sea menor de `1.05`. Como podemos ver hay varios parámetros que están muy lejos de haber convergido.
+
+## Diagnóstico de autocorrelación
+
+```{r}
+autocorr.diag(as.mcmc(modelo))
+```
+
+Este diagnóstico mide qué tanto depende muestras subsecuentes de las cadenas. Por ejemplo, qué tan correlacionada está la iteración 100, con la 110 (retraso de 10 iteraciones). Generalmente se considera que las cadenas que convergen son independientes de si mismas, o sea que tienen autocorrelación de menos de 0.1.
+
+## Diagnóstico de Geweke
+
+```{r}
+geweke.plot(as.mcmc(modelo))
+```
+
+Como regla, se considera que el valor del estadístico de Geweke debe ser menor a 2.5 para cada parámetro.
+
+# Conclusiones
+
+Es útil ver cómo funciona la DWPR bayesiana, pues la sintaxis de JAGS permite ver de cerca lo que la versión frecuentista está haciendo. Sin embargo, es difícil obtener modelos que converjan. Yo recomendaría utilizar este método sólo en caso de tener información relevante sobre el diseño de muestreo, de manera que podamos corregir sesgos de detección, por ejemplo.
