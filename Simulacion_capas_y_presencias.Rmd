@@ -1,7 +1,7 @@
 ---
-title: "Simulacion de capas y puntos de presencia"
+title: "DWPR"
 author: "Gerardo Martin"
-date: "6 de abril de 2018"
+date: "4 de abril de 2018"
 output: html_document
 ---
 
@@ -9,142 +9,262 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-Gerardo Martín
+Ahora que ya tenemos las presencias y las capas simuladas, veremos cómo hacer un modelo Poisson para sólo presencias, que es equivalente a un proceso Poisson de puntos. De inicio lo haré con la función glm, y luego mostraré cómo hacer lo mismo en un marco Bayesiano, modelando la autocorrelación espacial con una distribución normal-condicional autorrgresiva.
 
-Este script genera las variables que se van a utilizar en el taller de modelación de nichos con métodos bayesianos. El script está basado en el tutorial para modelar la autocorrelación espacial de Petr Keil (https://www.r-bloggers.com/spatial-autocorrelation-of-errors-in-jags/)
+Comenzaremos leyendo las capas que generamos anteriormente y transformándolas a dataframe. Posteriormente transformaremos las presencias a formato ráster y de ráster a data.frame. 
 
-Comenzamos por cargar los paquetes
-
-
-```{r}
-library(mvtnorm)   # para simular distribuciones normales multivariadas
-library(raster)    # para trabajar con objetos de clase ráster
-library(foreach)   # para hacer loops de manera mas avanzada
-library(dismo)     # para generar las presencias
-```
-
-Seguimos declarando las funciones que vamos a usar y sus contenidos
-
-Primero la función que calcula la distancia desde cada píxel a los demás. Esta función sólo requiere como argumento la longitud de los lados. Por el momento sólo trabajaremos con un espacio cuadrado
-```{r}
-matriz.dists <- function(long.lado)
-{
-      coords.filas <- rep(1:long.lado, times=long.lado)
-      coords.column <- rep(1:long.lado, each=long.lado)
-      filas.column <- data.frame(coords.filas, coords.column)
-      D <- dist(filas.column, method="euclidean", diag=TRUE, upper=TRUE)
-      D <- as.matrix(D)
-      return(D)
-}
-```
-
-Seguimos con la función que va a simular las variables
+A estas alturas es importantísimo aclarar que es necesario siempre trabajar en un sistema de coordenadas proyectado, pues necesitamos que cada píxel represente unidades de área iguales.
 
 ```{r}
-sup.correl <- function(long.lado, media.global, lambda){
-      
-      require(mvtnorm)
-      
-      D <- matriz.dists(long.lado)
-      # Aquí se escala la matríz por la función exponencial (puede ser otra función!)
-      #Este es el efecto del espacio, las celdas vecinas se parecen más entre si
-      SIGMA <- exp(-lambda*D)
-      mu <- rep(media.global, times=long.lado*long.lado)
-      # Aquí generamos el contenido de la matriz que después será un objeto ráster
-      # El contenido será generado con una distribución normal multivariada
-      M <- matrix(nrow=long.lado, ncol=long.lado)
-      M[] <- rmvnorm(1, mu, SIGMA)
-      return(M)
-}
-```
+library(raster); library(R2jags); library(parallel); library(ggplot2)
 
-Y la función que transforma la vairable simulada de matriz a ráster
+capas <- readRDS('capas-experimento.rds')
+presencias <- readRDS('presencias.rds')
 
-```{r}
-matriz.a.raster <- function(matriz, extension)
-{
-      require(raster)
-      
-      rast <- raster(matriz)
-      rast@extent@xmax <- extension
-      rast@extent@ymax <- extension
-      return(rast)
-}
-```
-
-Ahora ya podemos rimular unas superficies....
-
-Para obtener resultados similares vamos a determinar una semilla, que es el número a partir del cuál se generará la serie de números aleatorios
-```{r}
-set.seed(14392)
-```
-
-Por mis H....s decidí que vamos a trabajar con 5 variables que representarán diversos aspectos del clima. El efecto de la autocorrelación espacial en cada variable será diferente y generado de manera aleatoria con una distribución uniforme, al igual que las medias globales de cada variable. Las lambdas y las medias globales son pasadas en lote a las funciones creadas arriba por medio de foreach
-
-```{r}
-lambdas <- runif(5, 0.01, 0.7) # efectos de autocorrelación
-long.lado <- 50 #Tamaño de las capas ráster
-medias.globales <- runif(5, -20, 20) #Medias de cada capa
-dists <- matriz.dists(long.lado = long.lado)
-
-capas <- foreach(i = seq_along(lambdas)) %do% {
-      mat <- sup.correl(long.lado = long.lado, media.global = medias.globales[i], lambda = lambdas[i])
-      r <- matriz.a.raster(mat, extension = 50)
-      return(r)
-}
-
-capas <- stack(capas)
-
-saveRDS(capas, 'capas-experimento.rds')
-
-plot(capas)
-
-```
-
-Ya con las capas creadas podemos generar los puntos de presencia que utilizaremos en los tutoriales que siguen (LGCP y JAGS). Los puntos los vamos a generar con un método que le aprendí al buen lichoso... Distancias de mahalanobis. Para hacer esto:
-1. Extraemos todos los datos generados arriba y ponerlos en forma de "data.frame"
-2. Generamos la matriz de covarianza (por aquello de las correlaciones y colinearidades)
-3. Calculamos las distancias centrando las variables en las medias globales calculadas arriba
-4. Transformando las distancias en ráster
-5. Transformando las distancias en probabilidades con un modelo logístico
-
-```{r}
 capas.df <- data.frame(rasterToPoints(capas))
+presencias.r <- rasterize(presencias, capas[[1]], fun = 'count')
+presencias.r[is.na(presencias.r[])] <- 0
 
-cov = cov(capas.df[,paste0('layer.',1:5)])
+presencias.df <- data.frame(rasterToPoints(presencias.r))
 
-dist.mahal <- mahalanobis(capas.df[,paste0('layer.',1:5)], center = medias.globales, cov = cov) 
-
-dist.r <- rasterFromXYZ(data.frame(capas.df[,c('x', 'y')], mahal = dist.mahal))
-
-prob.pres <- exp(dist.r*(-1))/(1 + exp(dist.r*(-1)))
-
-plot(stack(dist.r, prob.pres))
+#Los pesos los especificamos con base en el tamaño del área de estudio dividida entre el número de puntos de cuadratura (background). Para este ejercicio utilizaremos 200.
 
 ```
 
-Finalmente con las funciones del paquete dismo podemos generar los puntos de presencia de acuerdo con las probabilidades calculadas arriba.
-
-Para introducir algo realismo, vamos además a introducir algo de ruido normalmente distribuido equivalente a 75% del tamaño de los píxeles
-
+Ahora necesitamos especificar los pesos que servirán para convertir estadísticamente las ausencias en puntos de cuadratura (background en lenguaje de MaxEnt). Se ha sugerido que los pesos deben ser equivalentes al área de la región de estudio dividida entre el número de puntos de cuadratura (estos pueden exceder en número el número de píxeles).
 
 ```{r}
-presencias <- randomPoints(mask = prob.pres, n = 300, prob = T)
+pesos <- rep(50 * 50, nrow(capas.df))
 
-ruido.x <- rnorm(nrow(presencias), 0, sd = 1)
-ruido.y <- rnorm(nrow(presencias), 0, sd = 1)
+pesos[presencias.df$layer > 0] <- 1/pesos[1]
+pesos[presencias.df$layer == 0] <- pesos[presencias.df$layer == 0]/length(which(presencias.df$layer == 0))
 
-presencias.ruido <- presencias
-
-presencias.ruido[,1] <- presencias.ruido[,1] + ruido.x
-presencias.ruido[,2] <- presencias.ruido[,2] + ruido.y
-
-saveRDS(presencias.ruido, 'presencias.rds')
-
-plot(prob.pres); points(presencias)
-plot(prob.pres); points(presencias.ruido)
+#Aquí es donde entramos los "sub-pesos" para las presencias
+capas.df$pres <- presencias.df$layer
 ```
 
 
+Ahora que ya tenermos la base de dato completa y lista para analizar continuamos con el modelo que pasaremos a JAGS. Hay dos alternativas para pasarle el modelo a JAGS, aquí sólo vamos a utilizar una que sirve para todas las implementaciones de JAGS, que son con un sólo procesador o en paralelo (tantos procesadores como tengamos, el procesamiento es mucho más rápido).
 
+Por razones de tiempo, vamos a saltarnos el paso de elegir el modelo más óptimo manualmente y vamos a hacer selección automatizada. Según mis cálculos y por la manera en que generamos las presencias no debería ser muy diferente de una ecuación polinomial de segundo grado:
+
+```{r}
+modelo.glm <- step(glm(pres/pesos ~ layer.1 + I(layer.1^2) +
+                        layer.2 + I(layer.2^2) +
+                        layer.3 + I(layer.3^2) +
+                        layer.4 + I(layer.4^2) +
+                        layer.5 + I(layer.5^2),
+                  weights = pesos,
+                  family = poisson(),
+                  data = capas.df))
+```
+
+Veamos el "summary"
+
+```{r}
+summary(modelo.glm)
+```
+
+Y podemos de una vez revisar las predicciones
+
+```{r, fig.height=6, fig.width=7, echo=F}
+preds.glm <- predict(modelo.glm)
+
+preds.glm.exp <- exp(preds.glm)
+preds.exp.r <- rasterFromXYZ(data.frame(capas.df[,c("x", "y")], preds.glm.exp))
+
+resids <- residuals(modelo.glm)
+resids.r <- rasterFromXYZ(data.frame(capas.df[, c("x", "y")], resids = resids))
+
+plot(preds.exp.r); points(presencias)
+plot(resids.r); points(presencias)
+```
+
+Comparemos estos resultados con la capa de distancia que utilizamos para simular las presencias:
+
+```{r Resultados DWPR, fig.height=6, fig.width=7}
+prob.pres <- readRDS("Probabilidad presencia.rds")
+plot(prob.pres, main = "Probabilidad de presencia")
+plot(preds.exp.r, main = "Intensidad estimada con DWPR")
+```
+
+Parece que no nos ha ido tan mal después de todo, aunque dado que los residuales muestran un patrón muy marcado, sí nos conviene modelar de cierto modo la autocorrelación espacial. Para ello, comenzaré por enseñarles cómo repetir el modelo de arriba con métodos bayesianos en JAGS. Finalmente les mostraré cómo implementarlo en OpenBUGS para modelar la autocorrelación espacial.
+
+Para implemental el modelo en JAGS necesitamos escribirlo como una cadena de texto. La sintaxis de JAGS y OpenBUGS son muy similares entre sí y con R, así que no habrá grandes problemas para que le entiendan.
+
+Las principales diferencias son que JAGS y OB sólo aceptan la asignación de cantidades por medio de "<-", para variables determinísticas y con "~" para las variables o nodos estocásticos. En cualquier tipo de variable está prohibida la reasignación de cantidades, por ejemplo:
+
+```{r}
+x <- c(); x[1] <- 1; x[2] <- 2; x[1] <- 3
+```
+
+Resultaría en un error, pues estaríamos reasignando el contenido de x[1]
+
+El script de JAGS consta de dos secciones: las distribuciones previas (los famosos priors) y la función de verosimilitud. Una de las bondades de JAGS y OB es que no es necesario que estén en un orden específico, pues el script sólo es interpretado como una serie de declaraciones.
+
+El modelo que corrimos arriba se epsecifica de la siguiente manera:
+```{r}
+modelString <- "model{
+
+#Función de verosimilitud
+
+for(i in 1:n){
+
+      log(lambda[i]) <- alpha + beta.1 * layer.1 + beta.1.1 * pow(layer.1, 2) + 
+                        beta.2 * layer.2 + beta.2.1 * pow(layer.2, 2) +
+                        beta.3 * layer.3 + beta.3.1 * pow(layer.3, 2) +
+                        beta.4 * layer.4 + beta.4.1 * pow(layer.4, 2) +
+                        beta.5 * layer.5 + beta.5.1 * pow(layer.5, 2)
+
+      lambda.w[i] <- lambda[i] * pesos[i]
+
+      pres[i] ~ dpois(lambda.w[i])
+}
+
+#Distribuciones previas de los parámetros de regresión
+
+      alpha ~ dnorm(0, 0.0001)
+      beta.1 ~ dnorm(0, 0.0001)
+      beta.1.1 ~ dnorm(0, 0.0001)
+      beta.2 ~ dnorm(0, 0.0001)
+      beta.2.1 ~ dnorm(0, 0.0001)
+      beta.3 ~ dnorm(0, 0.0001)
+      beta.3.1 ~ dnorm(0, 0.0001)
+      beta.4 ~ dnorm(0, 0.0001)
+      beta.4.1 ~ dnorm(0, 0.0001)
+      beta.5 ~ dnorm(0, 0.0001)
+      beta.5.1 ~ dnorm(0, 0.0001)
+
+}"
+
+writeLines(modelString, 'JAGS-model.txt')
+```
+
+El script de arriba es bueno para entender la estructura del script, pero es poco flexible y no sirve para hacer selección de modelo.
+
+La manera más flexible de entrar el modelo es menos ilustrativa de lo que el modelo hace. La ventaja es que se pueden correr muchos modelos en lote. El truco está en especificar la matriz del modelo y pasar la matriz en la lista de datos para JAGS:
+
+```{r}
+modelString2 <- "model{
+
+      for(i in 1:n){
+            log(lambda[i]) <- inprod(beta[], X[i,])
+            lambda.w[i] <- lambda[i] * pesos[i]
+            pres[i] ~ dpois(lambda.w[i])
+      }
+
+      for(i in 1:nX){
+            beta[i] ~ dnorm(0, 0.0001)
+      }
+
+}"
+
+writeLines(modelString2, "JAGS-model-2.txt")
+```
+
+Ahora sólo vamos a trabajar con la segunda versión del modelo. Lo que sigue es formatear los datos. Para ello necesitamos crear una lista que contenga TODA la información requerida para correr el modelo especificado arriba.
+
+Para ello, especificamos la matriz del modelo, la incluimos en la lista de datos (junto con las presencias, pesos, número de variables y observaciones). Finalmente necesitamos también un vector con el nombre de los parámetros que vamos a monitorear al correr el modelo.
+
+```{r}
+
+X.mat <- model.matrix( formula("~ layer.1 + I(layer.1^2) +
+                        layer.2 + I(layer.2^2) +
+                        layer.3 + I(layer.3^2) +
+                        layer.4 + I(layer.4^2) +
+                        layer.5 + I(layer.5^2)") ,datos.regresion)
+
+lista.datos <- list(X = X.mat, pres = capas.df$pres, #Las presencias sub-pesadas
+                  n = nrow(X.mat),  pesos = pesos,
+                  nX = ncol(X.mat))
+
+parametros <- c("beta")
+
+```
+
+Ahora ya estamos listos para correr JAGS. Simplemente hay un par de cosas más que considerar:
+
+1. El número de iteraciones (n.iter)
+2. La proporción de iteraciones que se guardarán (n.thin)
+3. El número de iteraciones que se descartarán al inicio de las cadenas (n.burnin)
+4. El número de cadenas (n.chains)
+
+En un experimento del mundo real esto depende completamente de la convergencia, es decir, si el muestreador encontró las distribuciones "verdaderas" de los parámetros. Más tarde veremos cómo se hace esto:
+
+Corriendo JAGS:
+
+```{r}
+modelo <- jags.parallel(data = lista.datos,
+               model.file = "JAGS-model-2.txt",
+               parameters.to.save = parametros,
+               n.chains = 3,
+               n.iter = 10000,
+               n.thin = 9,
+               n.burnin = 1000,
+               n.cluster = 3)
+```
+
+Una vez corrido el modelo necesitamos revisar que efectivamente hayamos encontrado los valores óptimos de los parámetros. El primer paso es revisar el parámetro "Rhat" y el número de muestras efectivas, lo cual siempre queda guardado en el resumen del modelo. Como regla de pulgar necesitamos que "Rhat" siempre valga menos de 1.1 y que el número de muestras efectivas sea mayor de 1000:
+
+```{r}
+print(modelo)
+```
+
+A la hora de revisar el resumen del modelo podemos empezar a detectar variables que no convergen...
+
+Después vemos cómo se comportaron las cadenas:
+
+```{r Trace and density plots 1, fig.height=8, fig.width=6}
+library(ggmcmc)
+
+ggs_traceplot(ggs(as.mcmc(modelo)[,1:5]))
+ggs_density(ggs(as.mcmc(modelo)[,1:5]))
+```
+
+```{r Trace and density plots 2, fig.height=8, fig.width=6}
+ggs_traceplot(ggs(as.mcmc(modelo)[,6:11]))
+ggs_density(ggs(as.mcmc(modelo)[,6:11]))
+```
+
+Antes de revisar los resultados de esta corrida de JAGS, veamos cómo especificar el modelo en OpenBUGS, y cómo vamos a incluir el componente espacial:
+
+```{r}
+modelString3 <- "model{
+
+      for(i in 1:n){
+            log(lambda[i]) <- inprod(beta[], X[i,])
+            lambda.w[i] <- lambda[i] * pesos[i]
+            pres[i] ~ dpois(lambda.w[i])
+      }
+
+      rho[1:n] ~ car.normal(adj[], weights[], num[], tauSp)
+
+      for(i in 1:nX){
+            beta[i] ~ dnorm(0, 0.0001)
+      }
+
+      tauSp <- pow(sdSp, -2)
+      sdSp ~ dunif(0, 5)
+
+}"
+```
+
+Ahora vamos a extraer la info necesaria para cada argumento de la función car.normal de OpenBUGS
+
+```{r}
+library(spdep); library(R2OpenBUGS); library(BRugs)
+
+nb <- dnearneigh(as.matrix(capas.df[, c("x", "y")]), 0, 1.5)
+obnb <- nb2WB(nb)
+
+table(card(nb))
+```
+
+Lo que esta función hace es determinar cuáles píxeles están en contacto con cuáles, y por lo tanto influenciando la dependencia espacial. La segunda línea tranforma el formato en una lista que puede ser leida por OpenBUGS, y que contiene los argumentos adj (adyacencias), weights (pesos) y num (número de vecinos). Con la tercera línea podemos ver cuántos píxeles (segunda línea del resultado) tienen qué número de vecinos (primera línea del resultado).
+
+Ahora sí vamos a preparar los datos que necesitamos para OpenBUGS, el proceso es un poco distinto que para JAGS, pues es más quisquilloso:
+
+```{r}
+
+```
 
