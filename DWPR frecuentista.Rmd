@@ -1,0 +1,94 @@
+---
+title: "DPWR frecuentista"
+author: "Gerardo Martin"
+date: "2 de mayo de 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Ahora que ya tenemos las presencias y las capas simuladas, veremos cómo hacer un modelo Poisson para sólo presencias, que es muy similar a un proceso Poisson de puntos. De inicio lo haré con la función glm, y luego mostraré cómo hacer lo mismo en un marco Bayesiano.
+
+Comenzaremos leyendo las capas que generamos anteriormente y transformándolas a `data.frame`. Posteriormente transformaremos las presencias a formato ráster y de ráster a `data.frame`. 
+
+A estas alturas es importantísimo aclarar que es necesario **siempre** trabajar en un sistema de coordenadas proyectado, pues necesitamos que cada píxel represente unidades de área iguales.
+
+# Cargando y formateando los datos
+
+```{r Cargando datos}
+library(raster)
+
+capas <- readRDS('capas-experimento.rds')
+presencias <- readRDS('presencias.rds')
+
+capas.df <- data.frame(rasterToPoints(capas))
+presencias.r <- rasterize(presencias, capas[[1]], fun = 'count')
+presencias.r[is.na(presencias.r[])] <- 0
+
+presencias.df <- data.frame(rasterToPoints(presencias.r))
+
+```
+
+## Especificando los pesos
+
+Ahora necesitamos especificar los pesos que servirán para convertir estadísticamente las ausencias en puntos de cuadratura (background en lenguaje de MaxEnt). Se ha sugerido que los pesos deben ser equivalentes al área de la región de estudio dividida entre el número de puntos de cuadratura (estos pueden exceder en número el número de píxeles).
+
+```{r}
+pesos <- rep(50 * 50, nrow(capas.df))
+
+pesos[presencias.df$layer > 0] <- 1/pesos[1]
+pesos[presencias.df$layer == 0] <- pesos[presencias.df$layer == 0]/length(which(presencias.df$layer == 0))
+
+#Aquí es donde entramos los "sub-pesos" para las presencias
+capas.df$pres <- presencias.df$layer
+```
+
+# Corriendo el modelo
+
+Ahora vamos a correr el modelo. En una situación real sería deseable contrastar varios modelos, aquí por razones de tiempo vamos a seleccionar el modelo reduciendo el AIC por medio de la eliminación de variables:
+
+```{r}
+modelo.glm <- step(glm(pres/pesos ~ layer.1 + I(layer.1^2) +
+                        layer.2 + I(layer.2^2) +
+                        layer.3 + I(layer.3^2) +
+                        layer.4 + I(layer.4^2) +
+                        layer.5 + I(layer.5^2),
+                  weights = pesos,
+                  family = poisson(),
+                  data = capas.df))
+```
+
+Veamos el `summary`
+
+```{r}
+summary(modelo.glm)
+```
+
+## Revisando el patrón de favorabilidad del modelo
+
+Como utilizamos las capas completas, sólo necesitamos extaer las predicciones del modelo y rasterizarlas. De una vez podemos ver los residuales:
+
+```{r, fig.height=6, fig.width=7, echo=F}
+preds.glm <- predict(modelo.glm)
+
+preds.glm.exp <- exp(preds.glm)
+preds.exp.r <- rasterFromXYZ(data.frame(capas.df[,c("x", "y")], preds.glm.exp))
+
+resids <- residuals(modelo.glm)
+resids.r <- rasterFromXYZ(data.frame(capas.df[, c("x", "y")], resids = resids))
+
+plot(preds.exp.r); points(presencias)
+plot(resids.r); points(presencias)
+```
+
+# Comparando las predicciones con la favorabilidad simulada
+
+```{r Resultados DWPR, fig.height=6, fig.width=10}
+prob.pres <- readRDS("Probabilidad presencia.rds")
+
+par(mfrow = c(1, 2))
+plot(prob.pres, main = "Probabilidad de presencia")
+plot(preds.exp.r, main = "Intensidad estimada con DWPR")
+```
